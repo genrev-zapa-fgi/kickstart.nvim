@@ -87,6 +87,29 @@ P.S. You can delete this when you're done too. It's your config now! :)
 -- Set <space> as the leader key
 -- See `:help mapleader`
 --  NOTE: Must happen before plugins are loaded (otherwise wrong leader will be used)
+--
+
+local find_git_root = function()
+  local current_file = vim.api.nvim_buf_get_name(0)
+  local current_dir
+  local cwd = vim.fn.getcwd()
+
+  if current_file == '' then
+    current_dir = cwd
+  else
+    current_dir = vim.fn.fnamemodify(current_file, ':h')
+  end
+
+  local git_root = vim.fn.systemlist('git -C ' .. vim.fn.escape(current_dir, ' ') .. ' rev-parse --show-toplevel')[1]
+  if vim.v.shell_error ~= 0 then
+    print 'Not a git repository. Searching on current working directory'
+    return cwd
+  end
+  return git_root
+end
+
+local is_biome_present = vim.uv.fs_stat(find_git_root() .. '/biome.jsonc') and true or false
+
 vim.g.mapleader = ' '
 vim.g.maplocalleader = ' '
 
@@ -233,6 +256,7 @@ vim.opt.rtp:prepend(lazypath)
 require('lazy').setup({
   -- NOTE: Plugins can be added with a link (or for a github repo: 'owner/repo' link).
   'tpope/vim-sleuth', -- Detect tabstop and shiftwidth automatically
+  'tpope/vim-fugitive', -- Detect tabstop and shiftwidth automatically
   'AndrewRadev/tagalong.vim',
 
   -- NOTE: Plugins can also be added by using a table,
@@ -258,6 +282,21 @@ require('lazy').setup({
         changedelete = { text = '~' },
       },
     },
+  },
+
+  {
+    'folke/flash.nvim',
+    event = 'VeryLazy',
+    ---@type Flash.Config
+    opts = {},
+  -- stylua: ignore
+  keys = {
+    { "s", mode = { "n", "x", "o" }, function() require("flash").jump() end, desc = "Flash" },
+    { "S", mode = { "n", "x", "o" }, function() require("flash").treesitter() end, desc = "Flash Treesitter" },
+    { "r", mode = "o", function() require("flash").remote() end, desc = "Remote Flash" },
+    { "R", mode = { "o", "x" }, function() require("flash").treesitter_search() end, desc = "Treesitter Search" },
+    { "<c-s>", mode = { "c" }, function() require("flash").toggle() end, desc = "Toggle Flash Search" },
+  },
   },
 
   -- NOTE: Plugins can also be configured to run Lua code when they are loaded.
@@ -425,8 +464,8 @@ require('lazy').setup({
     'neovim/nvim-lspconfig',
     dependencies = {
       -- Automatically install LSPs and related tools to stdpath for Neovim
-      { 'williamboman/mason.nvim', config = true }, -- NOTE: Must be loaded before dependants
-      'williamboman/mason-lspconfig.nvim',
+      { 'mason-org/mason.nvim', config = true }, -- NOTE: Must be loaded before dependants
+      'mason-org/mason-lspconfig.nvim',
       'WhoIsSethDaniel/mason-tool-installer.nvim',
 
       -- Useful status updates for LSP.
@@ -647,33 +686,89 @@ require('lazy').setup({
         desc = '[F]ormat buffer',
       },
     },
-    opts = {
-      notify_on_error = false,
-      format_on_save = function(bufnr)
-        -- Disable "format_on_save lsp_fallback" for languages that don't
-        -- have a well standardized coding style. You can add additional
-        -- languages here or re-enable it for the disabled ones.
-        local disable_filetypes = { c = true, cpp = true }
-        return {
-          timeout_ms = 500,
-          lsp_fallback = not disable_filetypes[vim.bo[bufnr].filetype],
-        }
-      end,
-      formatters_by_ft = {
-        lua = { 'stylua' },
+    config = function()
+      local fs = require 'conform.fs'
+      local util = require 'conform.util'
+
+      require('conform').setup {
+        notify_on_error = false,
+        format_on_save = function(bufnr)
+          -- Disable "format_on_save lsp_fallback" for languages that don't
+          -- have a well standardized coding style. You can add additional
+          -- languages here or re-enable it for the disabled ones.
+          local disable_filetypes = { c = true, cpp = true }
+          return {
+            timeout_ms = 500,
+            lsp_fallback = not disable_filetypes[vim.bo[bufnr].filetype],
+          }
+        end,
+        formatters = {
+          shfmt = {
+            args = { '-i', '2', '-filename', '$FILENAME' },
+          },
+          prettier = {
+            command = util.from_node_modules(fs.is_windows and 'prettier.cmd' or 'prettier'),
+            args = function(self, ctx)
+              return { '--stdin-filepath', '$FILENAME' }
+            end,
+            range_args = function(self, ctx)
+              local start_offset, end_offset = util.get_offsets_from_range(ctx.buf, ctx.range)
+              local args = { '--stdin-filepath', '$FILENAME' }
+              return vim.list_extend(args, { '--range-start=' .. start_offset, '--range-end=' .. end_offset })
+            end,
+            condition = function()
+              return not is_biome_present
+            end,
+          },
+          eslint_d = {
+            command = util.from_node_modules 'eslint_d',
+            args = { '--fix-to-stdout', '--stdin', '--stdin-filename', '$FILENAME' },
+            condition = function()
+              return not is_biome_present
+            end,
+          },
+          biome = {
+            command = util.from_node_modules 'biome',
+            stdin = true,
+            args = { 'check', '--write', '--stdin-file-path', '$FILENAME' },
+            condition = function()
+              return is_biome_present
+            end,
+          },
+          formatters_by_ft = {
+            cpp = { 'clang-format' },
+            lua = { 'stylua' },
+            python = { 'isort', 'black' },
+            javascript = { 'prettier', 'eslint_d', 'biome' },
+            typescript = { 'prettier', 'eslint_d', 'biome' },
+            javascriptreact = { 'prettier', 'eslint_d', 'biome' },
+            typescriptreact = { 'prettier', 'eslint_d', 'biome' },
+          },
+        },
         -- Conform can also run multiple formatters sequentially
         -- python = { "isort", "black" },
         --
         -- You can use 'stop_after_first' to run the first available formatter from the list
         -- javascript = { "prettierd", "prettier", stop_after_first = true },
-      },
-    },
+      }
+    end,
   },
 
   {
     'windwp/nvim-autopairs',
     event = 'InsertEnter',
     config = true,
+  },
+
+  {
+    'nvim-neo-tree/neo-tree.nvim',
+    branch = 'v3.x',
+    dependencies = {
+      'nvim-lua/plenary.nvim',
+      'nvim-tree/nvim-web-devicons', -- not strictly required, but recommended
+      'MunifTanjim/nui.nvim',
+      -- {"3rd/image.nvim", opts = {}}, -- Optional image support in preview window: See `# Preview Mode` for more information
+    },
   },
 
   {
@@ -765,7 +860,7 @@ require('lazy').setup({
           -- Accept ([y]es) the completion.
           --  This will auto-import if your LSP supports it.
           --  This will expand snippets if the LSP sent a snippet.
-          ['<C-y>'] = cmp.mapping.confirm { select = true },
+          ['<CR>'] = cmp.mapping.confirm { select = true },
 
           -- If you prefer more traditional completion keymaps,
           -- you can uncomment the following lines
